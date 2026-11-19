@@ -340,7 +340,7 @@ TEST(test_buffer, can_transform_without_dedicated_thread)
 // Regression test: timeout must be always respected regardless of duration
 TEST(test_buffer, can_transform_timeout_is_respected)
 {
-  rclcpp::Clock::SharedPtr clock = std::make_shared<rclcpp::Clock>(RCL_SYSTEM_TIME);
+  rclcpp::Clock::SharedPtr clock = std::make_shared<rclcpp::Clock>(RCL_STEADY_TIME);
   tf2_ros::Buffer buffer(clock);
   buffer.setUsingDedicatedThread(true);
 
@@ -350,8 +350,8 @@ TEST(test_buffer, can_transform_timeout_is_respected)
     double max_s;
   };
   for (const auto & tc : std::vector<TestCase>{
-    {0.000, 0.001},    // zero: returns immediately, no sleep
-    {0.002, 0.004},    // sub-10ms: must not inflate to hardcoded 10ms sleep
+    {0.000, 0.008},    // allow logging and scheduling overhead below one 10ms polling period
+    {0.002, 0.008},    // sub-10ms: must not inflate to hardcoded 10ms sleep
     {0.020, 0.040},    // above 10ms: loop runs multiple 10ms sleep iterations
   })
   {
@@ -361,6 +361,7 @@ TEST(test_buffer, can_transform_timeout_is_respected)
         tf2::TimePointZero,
         tf2::durationFromSec(tc.timeout_s)));
     const rclcpp::Duration elapsed = clock->now() - start;
+    EXPECT_GE(elapsed, rclcpp::Duration::from_seconds(tc.timeout_s));
     EXPECT_LT(elapsed, rclcpp::Duration::from_seconds(tc.max_s)) << "timeout=" << tc.timeout_s;
   }
 }
