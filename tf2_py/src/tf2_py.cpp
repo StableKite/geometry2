@@ -3,6 +3,8 @@
 #include <tf2/buffer_core.hpp>
 #include <tf2/exceptions.hpp>
 
+#include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -105,8 +107,17 @@ static PyObject * tf2_connectivityexception = nullptr, * tf2_lookupexception = n
 struct buffer_core_t
 {
   PyObject_HEAD
-  tf2::BufferCore * bc;
+  std::shared_ptr<tf2::BufferCore> bc;
 };
+
+static std::shared_ptr<tf2::BufferCore> getBufferCore(PyObject * self)
+{
+  auto bc = std::atomic_load(&reinterpret_cast<buffer_core_t *>(self)->bc);
+  if (!bc) {
+    PyErr_SetString(PyExc_RuntimeError, "BufferCore has not been initialized");
+  }
+  return bc;
+}
 
 static PyObject * transform_converter(const geometry_msgs::msg::TransformStamped * transform)
 {
@@ -371,6 +382,15 @@ static int rosduration_converter(PyObject * obj, tf2::Duration * rt)
   return 0;
 }
 
+static PyObject * BufferCore_new(PyTypeObject * type, PyObject * args, PyObject * kw)
+{
+  PyObject * self = PyType_GenericNew(type, args, kw);
+  if (self) {
+    new (&reinterpret_cast<buffer_core_t *>(self)->bc) std::shared_ptr<tf2::BufferCore>();
+  }
+  return self;
+}
+
 static int BufferCore_init(PyObject * self, PyObject * args, PyObject * kw)
 {
   (void)kw;
@@ -381,43 +401,49 @@ static int BufferCore_init(PyObject * self, PyObject * args, PyObject * kw)
     return -1;
   }
 
-  reinterpret_cast<buffer_core_t *>(self)->bc = new tf2::BufferCore(cache_time);
+  try {
+    std::atomic_store(
+      &reinterpret_cast<buffer_core_t *>(self)->bc, std::make_shared<tf2::BufferCore>(cache_time));
+  } catch (const std::bad_alloc &) {
+    PyErr_NoMemory();
+    return -1;
+  }
 
   return 0;
 }
 
-static void BufferCore_finalize(PyObject * self)
+static void BufferCore_dealloc(PyObject * self)
 {
-  PyObject * error_type, * error_value, * error_traceback;
-
-  /* Save the current exception, if any. */
-  PyErr_Fetch(&error_type, &error_value, &error_traceback);
-
-  buffer_core_t * buffer_core = reinterpret_cast<buffer_core_t *>(self);
-
-  delete buffer_core->bc;
-
-  /* Restore the saved exception. */
-  PyErr_Restore(error_type, error_value, error_traceback);
+  std::destroy_at(&reinterpret_cast<buffer_core_t *>(self)->bc);
+  Py_TYPE(self)->tp_free(self);
 }
 
 static PyObject * allFramesAsYAML(PyObject * self, PyObject * args)
 {
   (void)args;
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   return stringToPython(bc->allFramesAsYAML());
 }
 
 static PyObject * allFramesAsString(PyObject * self, PyObject * args)
 {
   (void)args;
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   return stringToPython(bc->allFramesAsString());
 }
 
 static PyObject * canTransformCore(PyObject * self, PyObject * args, PyObject * kw)
 {
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   char * target_frame, * source_frame;
   tf2::TimePoint time;
   static const char * keywords[] = {"target_frame", "source_frame", "time", nullptr};
@@ -437,7 +463,10 @@ static PyObject * canTransformCore(PyObject * self, PyObject * args, PyObject * 
 
 static PyObject * canTransformFullCore(PyObject * self, PyObject * args, PyObject * kw)
 {
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   char * target_frame, * source_frame, * fixed_frame;
   tf2::TimePoint target_time, source_time;
   static const char * keywords[] =
@@ -477,7 +506,10 @@ static PyObject * asListOfStrings(std::vector<std::string> los)
 
 static PyObject * _chain(PyObject * self, PyObject * args, PyObject * kw)
 {
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   char * target_frame, * source_frame, * fixed_frame;
   tf2::TimePoint target_time, source_time;
   std::vector<std::string> output;
@@ -507,7 +539,10 @@ static PyObject * _chain(PyObject * self, PyObject * args, PyObject * kw)
 
 static PyObject * getLatestCommonTime(PyObject * self, PyObject * args)
 {
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   char * target_frame, * source_frame;
   tf2::CompactFrameID target_id, source_id;
   tf2::TimePoint tf2_time;
@@ -578,7 +613,10 @@ cleanup:
 
 static PyObject * lookupTransformCore(PyObject * self, PyObject * args, PyObject * kw)
 {
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   char * target_frame, * source_frame;
   tf2::TimePoint time;
   static const char * keywords[] = {"target_frame", "source_frame", "time", nullptr};
@@ -601,7 +639,10 @@ static PyObject * lookupTransformCore(PyObject * self, PyObject * args, PyObject
 
 static PyObject * lookupTransformFullCore(PyObject * self, PyObject * args, PyObject * kw)
 {
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   char * target_frame, * source_frame, * fixed_frame;
   tf2::TimePoint target_time, source_time;
   static const char * keywords[] =
@@ -630,7 +671,10 @@ static PyObject * lookupTransformFullCore(PyObject * self, PyObject * args, PyOb
 
 static PyObject * lookupVelocityCore(PyObject * self, PyObject * args, PyObject * kw)
 {
-  tf2::BufferCore * bc = ((buffer_core_t *)self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   char * tracking_frame, * observation_frame;
   tf2::TimePoint time;
   tf2::Duration averaging_interval;
@@ -658,7 +702,10 @@ static PyObject * lookupVelocityCore(PyObject * self, PyObject * args, PyObject 
 
 static PyObject * lookupVelocityFullCore(PyObject * self, PyObject * args)
 {
-  tf2::BufferCore * bc = ((buffer_core_t *)self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   char * tracking_frame, * observation_frame, * reference_frame, * reference_point_frame;
   tf2::TimePoint time;
   tf2::Duration averaging_interval;
@@ -737,7 +784,10 @@ static inline int checkRotationType(PyObject * o)
 static PyObject * setTransform(PyObject * self, PyObject * args)
 {
   PyObject * ret = nullptr;
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   PyObject * py_transform;
   char * authority;
   tf2::TimePoint time;
@@ -882,7 +932,10 @@ cleanup:
 static PyObject * setTransformStatic(PyObject * self, PyObject * args)
 {
   PyObject * ret = nullptr;
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   PyObject * py_transform;
   char * authority;
   tf2::TimePoint time;
@@ -1020,14 +1073,20 @@ cleanup:
 static PyObject * clear(PyObject * self, PyObject * args)
 {
   (void)args;
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   bc->clear();
   Py_RETURN_NONE;
 }
 
 static PyObject * _frameExists(PyObject * self, PyObject * args)
 {
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   char * frame_id_str;
   if (!PyArg_ParseTuple(args, "s", &frame_id_str)) {
     return nullptr;
@@ -1038,7 +1097,10 @@ static PyObject * _frameExists(PyObject * self, PyObject * args)
 static PyObject * _getFrameStrings(PyObject * self, PyObject * args)
 {
   (void)args;
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   std::vector<std::string> ids;
   bc->_getFrameStrings(ids);
   return asListOfStrings(ids);
@@ -1046,7 +1108,10 @@ static PyObject * _getFrameStrings(PyObject * self, PyObject * args)
 
 static PyObject * _allFramesAsDot(PyObject * self, PyObject * args, PyObject * kw)
 {
-  tf2::BufferCore * bc = reinterpret_cast<buffer_core_t *>(self)->bc;
+  const auto bc = getBufferCore(self);
+  if (!bc) {
+    return nullptr;
+  }
   static const char * keywords[] = {"time", nullptr};
   tf2::TimePoint time;
   if (!PyArg_ParseTupleAndKeywords(
@@ -1108,9 +1173,9 @@ bool staticInit()
   buffer_core_Type.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
   buffer_core_Type.tp_methods = buffer_core_methods;
   buffer_core_Type.tp_init = BufferCore_init;
-  buffer_core_Type.tp_finalize = BufferCore_finalize;
+  buffer_core_Type.tp_dealloc = BufferCore_dealloc;
   buffer_core_Type.tp_alloc = PyType_GenericAlloc;
-  buffer_core_Type.tp_new = PyType_GenericNew;
+  buffer_core_Type.tp_new = BufferCore_new;
 
 #if PYTHON_API_VERSION >= 1007
   tf2_exception =

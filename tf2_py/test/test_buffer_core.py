@@ -28,6 +28,7 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 
 from geometry_msgs.msg import TransformStamped
@@ -70,6 +71,30 @@ class TestBufferClient(unittest.TestCase):
 
     def setUp(self):
         pass
+
+    def test_buffer_requires_initialization(self):
+        buffer_core = BufferCore.__new__(BufferCore)
+        with self.assertRaisesRegex(RuntimeError, 'BufferCore has not been initialized'):
+            buffer_core.clear()
+        buffer_core.__init__()
+        buffer_core.clear()
+
+    def test_shared_buffer_can_be_reinitialized(self):
+        class Buffer(BufferCore):
+            pass
+
+        buffer_core = Buffer()
+
+        def use_buffer(worker):
+            for _ in range(50):
+                if worker == 0:
+                    buffer_core.__init__()
+                else:
+                    self.assertIsInstance(buffer_core.all_frames_as_yaml(), str)
+                    buffer_core.clear()
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(use_buffer, range(8)))
 
     def test_all_frames_as_yaml(self):
         buffer_core = BufferCore()
