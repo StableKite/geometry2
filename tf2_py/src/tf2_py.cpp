@@ -35,74 +35,86 @@ inline PyObject * stringToPython(const char * input)
 inline std::string stringFromPython(PyObject * input)
 {
   Py_ssize_t size;
-  const char * data;
-  data = PyUnicode_AsUTF8AndSize(input, &size);
-  return std::string(data, size);
+  const char * data = PyUnicode_AsUTF8AndSize(input, &size);
+  return data ? std::string(data, size) : std::string();
 }
 
 /// \brief Imports a python module by name.
 /// \note The caller is responsible for decref'ing the returned object.
 /// \note If the return value is NULL then an exception is set.
 /// \return a reference to the imported module.
-inline PyObject * pythonImport(const std::string & name)
+static PyObject * importAttribute(const char * module_name, const char * attribute_name)
 {
-  PyObject * py_name = stringToPython(name);
-  if (!py_name) {
+  PyObject * module = PyImport_ImportModule(module_name);
+  if (!module) {
     return nullptr;
   }
-  PyObject * module = PyImport_Import(py_name);
-  Py_XDECREF(py_name);
-  return module;
+  PyObject * attribute = PyObject_GetAttrString(module, attribute_name);
+  Py_DECREF(module);
+  return attribute;
+}
+
+struct TfModuleState
+{
+  PyObject * transform_exception;
+  PyObject * connectivity_exception;
+  PyObject * lookup_exception;
+  PyObject * extrapolation_exception;
+  PyObject * invalid_argument_exception;
+  PyObject * timeout_exception;
+};
+
+extern PyModuleDef tf_module;
+
+static TfModuleState * moduleState(PyObject * self)
+{
+  PyObject * module = PyType_GetModuleByDef(Py_TYPE(self), &tf_module);
+  return module ? static_cast<TfModuleState *>(PyModule_GetState(module)) : nullptr;
 }
 
 // Run x (a tf method, catching TF's exceptions and reraising them as Python exceptions)
 //
 #define WRAP(x) \
   do { \
+    const auto * state = moduleState(self); \
+    if (!state) { \
+      return nullptr; \
+    } \
     try \
     { \
       x; \
     } \
     catch (const tf2::ConnectivityException & e) \
     { \
-      PyErr_SetString(tf2_connectivityexception, e.what()); \
+      PyErr_SetString(state->connectivity_exception, e.what()); \
       return nullptr; \
     } \
     catch (const tf2::LookupException & e) \
     { \
-      PyErr_SetString(tf2_lookupexception, e.what()); \
+      PyErr_SetString(state->lookup_exception, e.what()); \
       return nullptr; \
     } \
     catch (const tf2::ExtrapolationException & e) \
     { \
-      PyErr_SetString(tf2_extrapolationexception, e.what()); \
+      PyErr_SetString(state->extrapolation_exception, e.what()); \
       return nullptr; \
     } \
     catch (const tf2::InvalidArgumentException & e) \
     { \
-      PyErr_SetString(tf2_invalidargumentexception, e.what()); \
+      PyErr_SetString(state->invalid_argument_exception, e.what()); \
       return nullptr; \
     } \
     catch (const tf2::TimeoutException & e) \
     { \
-      PyErr_SetString(tf2_timeoutexception, e.what()); \
+      PyErr_SetString(state->timeout_exception, e.what()); \
       return nullptr; \
     } \
     catch (const tf2::TransformException & e) \
     { \
-      PyErr_SetString(tf2_exception, e.what()); \
+      PyErr_SetString(state->transform_exception, e.what()); \
       return nullptr; \
     } \
   } while (0)
-
-static PyObject * pModulerclpy = nullptr;
-static PyObject * pModulerclpytime = nullptr;
-static PyObject * pModulebuiltininterfacesmsgs = nullptr;
-static PyObject * pModulegeometrymsgs = nullptr;
-static PyObject * tf2_exception = nullptr;
-static PyObject * tf2_connectivityexception = nullptr, * tf2_lookupexception = nullptr,
-  * tf2_extrapolationexception = nullptr,
-  * tf2_invalidargumentexception = nullptr, * tf2_timeoutexception = nullptr;
 
 struct buffer_core_t
 {
@@ -143,7 +155,7 @@ static PyObject * transform_converter(const geometry_msgs::msg::TransformStamped
   PyObject * prot_y = nullptr;
   PyObject * prot_z = nullptr;
   PyObject * prot_w = nullptr;
-  pclass = PyObject_GetAttrString(pModulegeometrymsgs, "TransformStamped");
+  pclass = importAttribute("geometry_msgs.msg", "TransformStamped");
   if (!pclass) {
     goto cleanup;
   }
@@ -159,7 +171,7 @@ static PyObject * transform_converter(const geometry_msgs::msg::TransformStamped
   }
 
   // we need to convert the time to python
-  builtin_interfaces_time = PyObject_GetAttrString(pModulebuiltininterfacesmsgs, "Time");
+  builtin_interfaces_time = importAttribute("builtin_interfaces.msg", "Time");
   if (!builtin_interfaces_time) {
     goto cleanup;
   }
@@ -332,54 +344,107 @@ static tf2::TimePoint fromMsg(const builtin_interfaces::msg::Time & time_msg)
   return tf2::TimePoint(ns);
 }
 
+static int getOptionalTimeAttribute(PyObject * obj, const char * name, PyObject ** value)
+{
+#if PY_VERSION_HEX >= 0x030D0000
+  return PyObject_GetOptionalAttrString(obj, name, value);
+#else
+  *value = PyObject_GetAttrString(obj, name);
+  if (*value) {
+    return 1;
+  }
+  if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+    PyErr_Clear();
+    return 0;
+  }
+  return -1;
+#endif
+}
+
+static int timeParts(PyObject * obj, PyObject ** seconds, PyObject ** nanoseconds)
+{
+  const int has_seconds = getOptionalTimeAttribute(obj, "sec", seconds);
+  if (has_seconds <= 0) {
+    return has_seconds;
+  }
+  const int has_nanoseconds = getOptionalTimeAttribute(obj, "nanosec", nanoseconds);
+  if (has_nanoseconds <= 0) {
+    Py_CLEAR(*seconds);
+  }
+  return has_nanoseconds;
+}
+
+static int timeInNanoseconds(PyObject * obj, int64_t * value, const char * kind)
+{
+  PyObject * nanoseconds;
+  const int found = getOptionalTimeAttribute(obj, "nanoseconds", &nanoseconds);
+  if (found == 0) {
+    PyErr_Format(PyExc_TypeError, "%s must have sec and nanosec, or nanoseconds.", kind);
+  }
+  if (found <= 0) {
+    return 0;
+  }
+
+  *value = PyLong_AsLongLong(nanoseconds);
+  Py_DECREF(nanoseconds);
+  return PyErr_Occurred() ? 0 : 1;
+}
+
 static int rostime_converter(PyObject * obj, tf2::TimePoint * rt)
 {
-  if (PyObject_HasAttrString(obj, "sec") && PyObject_HasAttrString(obj, "nanosec")) {
-    PyObject * sec = PyObject_GetAttrString(obj, "sec");
-    PyObject * nanosec = PyObject_GetAttrString(obj, "nanosec");
+  PyObject * sec;
+  PyObject * nanosec;
+  const int found = timeParts(obj, &sec, &nanosec);
+  if (found < 0) {
+    return 0;
+  }
+  if (found == 1) {
     builtin_interfaces::msg::Time msg;
     msg.sec = PyLong_AsLong(sec);
     msg.nanosec = PyLong_AsUnsignedLong(nanosec);
+    Py_DECREF(nanosec);
+    Py_DECREF(sec);
+    if (PyErr_Occurred()) {
+      return 0;
+    }
     *rt = fromMsg(msg);
-    Py_XDECREF(nanosec);
-    Py_XDECREF(sec);
-    return PyErr_Occurred() ? 0 : 1;
+    return 1;
   }
 
-  if (PyObject_HasAttrString(obj, "nanoseconds")) {
-    PyObject * nanoseconds = PyObject_GetAttrString(obj, "nanoseconds");
-    const int64_t d = PyLong_AsLongLong(nanoseconds);
-    *rt = tf2::TimePoint(std::chrono::nanoseconds(d));
-    Py_XDECREF(nanoseconds);
-    return PyErr_Occurred() ? 0 : 1;
+  int64_t nanoseconds;
+  if (!timeInNanoseconds(obj, &nanoseconds, "time")) {
+    return 0;
   }
-
-  PyErr_SetString(PyExc_TypeError, "time must have sec and nanosec, or nanoseconds.");
-  return 0;
+  *rt = tf2::TimePoint(std::chrono::nanoseconds(nanoseconds));
+  return 1;
 }
 
 static int rosduration_converter(PyObject * obj, tf2::Duration * rt)
 {
-  if (PyObject_HasAttrString(obj, "sec") && PyObject_HasAttrString(obj, "nanosec")) {
-    PyObject * sec = PyObject_GetAttrString(obj, "sec");
-    PyObject * nanosec = PyObject_GetAttrString(obj, "nanosec");
-    *rt = std::chrono::seconds(PyLong_AsLong(sec)) +
-      std::chrono::nanoseconds(PyLong_AsUnsignedLong(nanosec));
-    Py_XDECREF(nanosec);
-    Py_XDECREF(sec);
-    return PyErr_Occurred() ? 0 : 1;
+  PyObject * sec;
+  PyObject * nanosec;
+  const int found = timeParts(obj, &sec, &nanosec);
+  if (found < 0) {
+    return 0;
+  }
+  if (found == 1) {
+    const auto seconds = PyLong_AsLong(sec);
+    const auto nanoseconds = PyLong_AsUnsignedLong(nanosec);
+    Py_DECREF(nanosec);
+    Py_DECREF(sec);
+    if (PyErr_Occurred()) {
+      return 0;
+    }
+    *rt = std::chrono::seconds(seconds) + std::chrono::nanoseconds(nanoseconds);
+    return 1;
   }
 
-  if (PyObject_HasAttrString(obj, "nanoseconds")) {
-    PyObject * nanoseconds = PyObject_GetAttrString(obj, "nanoseconds");
-    const int64_t d = PyLong_AsLongLong(nanoseconds);
-    *rt = std::chrono::duration_cast<tf2::Duration>(std::chrono::nanoseconds(d));
-    Py_XDECREF(nanoseconds);
-    return PyErr_Occurred() ? 0 : 1;
+  int64_t nanoseconds;
+  if (!timeInNanoseconds(obj, &nanoseconds, "duration")) {
+    return 0;
   }
-
-  PyErr_SetString(PyExc_TypeError, "duration must have sec and nanosec, or nanoseconds.");
-  return 0;
+  *rt = std::chrono::duration_cast<tf2::Duration>(std::chrono::nanoseconds(nanoseconds));
+  return 1;
 }
 
 static PyObject * BufferCore_new(PyTypeObject * type, PyObject * args, PyObject * kw)
@@ -414,8 +479,17 @@ static int BufferCore_init(PyObject * self, PyObject * args, PyObject * kw)
 
 static void BufferCore_dealloc(PyObject * self)
 {
+  auto * type = Py_TYPE(self);
+  PyObject_GC_UnTrack(self);
   std::destroy_at(&reinterpret_cast<buffer_core_t *>(self)->bc);
-  Py_TYPE(self)->tp_free(self);
+  type->tp_free(self);
+  Py_DECREF(type);
+}
+
+static int BufferCore_traverse(PyObject * self, visitproc visit, void * arg)
+{
+  Py_VISIT(Py_TYPE(self));
+  return 0;
 }
 
 static PyObject * allFramesAsYAML(PyObject * self, PyObject * args)
@@ -556,7 +630,10 @@ static PyObject * getLatestCommonTime(PyObject * self, PyObject * args)
   const tf2::TF2Error r = bc->_getLatestCommonTime(target_id, source_id, tf2_time, &error_string);
 
   if (r != tf2::TF2Error::TF2_NO_ERROR) {
-    PyErr_SetString(tf2_exception, error_string.c_str());
+    const auto * state = moduleState(self);
+    if (state) {
+      PyErr_SetString(state->transform_exception, error_string.c_str());
+    }
     return nullptr;
   }
 
@@ -568,7 +645,7 @@ static PyObject * getLatestCommonTime(PyObject * self, PyObject * args)
   PyObject * nanoseconds = nullptr;
   PyObject * ob = nullptr;
 
-  rclpy_time = PyObject_GetAttrString(pModulerclpytime, "Time");
+  rclpy_time = importAttribute("rclpy.time", "Time");
   if (!rclpy_time) {
     goto cleanup;
   }
@@ -742,8 +819,8 @@ static PyObject * lookupVelocityFullCore(PyObject * self, PyObject * args)
 static inline int checkTranslationType(PyObject * o)
 {
   PyTypeObject * translation_type =
-    reinterpret_cast<PyTypeObject *>(PyObject_GetAttrString(
-      pModulegeometrymsgs,
+    reinterpret_cast<PyTypeObject *>(importAttribute(
+      "geometry_msgs.msg",
       "Vector3"));
   if (!translation_type) {
     return 0;
@@ -763,8 +840,8 @@ static inline int checkTranslationType(PyObject * o)
 static inline int checkRotationType(PyObject * o)
 {
   PyTypeObject * rotation_type =
-    reinterpret_cast<PyTypeObject *>(PyObject_GetAttrString(
-      pModulegeometrymsgs,
+    reinterpret_cast<PyTypeObject *>(importAttribute(
+      "geometry_msgs.msg",
       "Quaternion"));
   if (!rotation_type) {
     return 0;
@@ -883,6 +960,9 @@ static PyObject * setTransform(PyObject * self, PyObject * args)
   }
 
   transform.child_frame_id = stringFromPython(child_frame_id);
+  if (PyErr_Occurred()) {
+    goto cleanup;
+  }
 
   transform.header.stamp = toMsg(time);
 
@@ -1020,6 +1100,9 @@ static PyObject * setTransformStatic(PyObject * self, PyObject * args)
 
   transform.child_frame_id = stringFromPython(child_frame_id);
   transform.header.frame_id = stringFromPython(frame_id);
+  if (PyErr_Occurred()) {
+    goto cleanup;
+  }
 
   if (rostime_converter(stamp, &time) != 1) {
     goto cleanup;
@@ -1148,124 +1231,105 @@ static struct PyMethodDef buffer_core_methods[] =
   {nullptr, nullptr, 0, nullptr}
 };
 
-static PyMethodDef module_methods[] = {
-  // {"Transformer", mkTransformer, METH_VARARGS},
-  {nullptr, nullptr, 0, nullptr},
+static PyType_Slot buffer_core_slots[] = {
+  {Py_tp_methods, buffer_core_methods},
+  {Py_tp_init, reinterpret_cast<void *>(BufferCore_init)},
+  {Py_tp_dealloc, reinterpret_cast<void *>(BufferCore_dealloc)},
+  {Py_tp_new, reinterpret_cast<void *>(BufferCore_new)},
+  {Py_tp_traverse, reinterpret_cast<void *>(BufferCore_traverse)},
+  {0, nullptr},
 };
 
-#ifndef _WIN32
-# pragma GCC diagnostic push
-# pragma GCC diagnostic ignored "-Wmissing-field-initializers"
-#endif
-static PyTypeObject buffer_core_Type = {
-  PyVarObject_HEAD_INIT(nullptr, 0)
-  "_tf2.BufferCore",                           /* tp_name */
-  sizeof(buffer_core_t),                       /* tp_basicsize */
-  // The other members are initialized in `staticInit`.
+static PyType_Spec buffer_core_spec = {
+  "_tf2.BufferCore",
+  sizeof(buffer_core_t),
+  0,
+  Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE,
+  buffer_core_slots,
 };
-#ifndef _WIN32
-# pragma GCC diagnostic pop
-#endif
 
-bool staticInit()
+struct ExceptionSpec
 {
-  // Initialize buffer_core_Type
-  buffer_core_Type.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE;
-  buffer_core_Type.tp_methods = buffer_core_methods;
-  buffer_core_Type.tp_init = BufferCore_init;
-  buffer_core_Type.tp_dealloc = BufferCore_dealloc;
-  buffer_core_Type.tp_alloc = PyType_GenericAlloc;
-  buffer_core_Type.tp_new = BufferCore_new;
+  const char * name;
+  PyObject * TfModuleState::* member;
+};
 
-#if PYTHON_API_VERSION >= 1007
-  tf2_exception =
-    PyErr_NewException(const_cast<char *>("tf2.TransformException"), nullptr, nullptr);
-  tf2_connectivityexception = PyErr_NewException(
-    const_cast<char *>("tf2.ConnectivityException"),
-    tf2_exception,
-    nullptr);
-  tf2_lookupexception = PyErr_NewException(
-    const_cast<char *>("tf2.LookupException"), tf2_exception,
-    nullptr);
-  tf2_extrapolationexception = PyErr_NewException(
-    const_cast<char *>("tf2.ExtrapolationException"),
-    tf2_exception, nullptr);
-  tf2_invalidargumentexception =
-    PyErr_NewException(
-    const_cast<char *>("tf2.InvalidArgumentException"),
-    tf2_exception, nullptr);
-  tf2_timeoutexception = PyErr_NewException(
-    const_cast<char *>("tf2.TimeoutException"),
-    tf2_exception, nullptr);
-#else
-  tf2_exception = stringToPython("tf2.error");
-  tf2_connectivityexception = stringToPython("tf2.ConnectivityException");
-  tf2_lookupexception = stringToPython("tf2.LookupException");
-  tf2_extrapolationexception = stringToPython("tf2.ExtrapolationException");
-  tf2_invalidargumentexception = stringToPython("tf2.InvalidArgumentException");
-  tf2_timeoutexception = stringToPython("tf2.TimeoutException");
-#endif
+static constexpr ExceptionSpec exceptions[] = {
+  {"TransformException", &TfModuleState::transform_exception},
+  {"ConnectivityException", &TfModuleState::connectivity_exception},
+  {"LookupException", &TfModuleState::lookup_exception},
+  {"ExtrapolationException", &TfModuleState::extrapolation_exception},
+  {"InvalidArgumentException", &TfModuleState::invalid_argument_exception},
+  {"TimeoutException", &TfModuleState::timeout_exception},
+};
 
-  pModulerclpy = pythonImport("rclpy");
-  pModulerclpytime = pythonImport("rclpy.time");
-  pModulebuiltininterfacesmsgs = pythonImport("builtin_interfaces.msg");
-  pModulegeometrymsgs = pythonImport("geometry_msgs.msg");
-
-  if (pModulerclpy == nullptr) {
-    printf("Cannot load rclpy module");
-    return false;
+static int moduleExec(PyObject * module)
+{
+  auto * state = static_cast<TfModuleState *>(PyModule_GetState(module));
+  for (const auto & spec : exceptions) {
+    const std::string qualified_name = std::string("tf2.") + spec.name;
+    auto & exception = state->*(spec.member);
+    exception = PyErr_NewException(qualified_name.c_str(), state->transform_exception, nullptr);
+    if (!exception || PyModule_AddObjectRef(module, spec.name, exception) < 0) {
+      return -1;
+    }
   }
 
-  if (pModulerclpytime == nullptr) {
-    printf("Cannot load rclpy.time.Time module");
-    return false;
+  PyObject * type = PyType_FromModuleAndSpec(module, &buffer_core_spec, nullptr);
+  if (!type) {
+    return -1;
   }
-
-  if (pModulegeometrymsgs == nullptr) {
-    printf("Cannot load geometry_msgs module");
-    return false;
-  }
-
-  if (pModulebuiltininterfacesmsgs == nullptr) {
-    printf("Cannot load builtin_interfaces module");
-    return false;
-  }
-
-  if (PyType_Ready(&buffer_core_Type) != 0) {
-    return false;
-  }
-  return true;
+  const int result = PyModule_AddObjectRef(module, "BufferCore", type);
+  Py_DECREF(type);
+  return result;
 }
 
-PyObject * moduleInit(PyObject * m)
+static int moduleTraverse(PyObject * module, visitproc visit, void * arg)
 {
-  PyModule_AddObject(m, "BufferCore", reinterpret_cast<PyObject *>(&buffer_core_Type));
-  PyObject * d = PyModule_GetDict(m);
-  PyDict_SetItemString(d, "TransformException", tf2_exception);
-  PyDict_SetItemString(d, "ConnectivityException", tf2_connectivityexception);
-  PyDict_SetItemString(d, "LookupException", tf2_lookupexception);
-  PyDict_SetItemString(d, "ExtrapolationException", tf2_extrapolationexception);
-  PyDict_SetItemString(d, "InvalidArgumentException", tf2_invalidargumentexception);
-  PyDict_SetItemString(d, "TimeoutException", tf2_timeoutexception);
-  return m;
+  const auto * state = static_cast<TfModuleState *>(PyModule_GetState(module));
+  if (state) {
+    for (const auto & spec : exceptions) {
+      Py_VISIT(state->*(spec.member));
+    }
+  }
+  return 0;
 }
 
-struct PyModuleDef tf_module = {
-  PyModuleDef_HEAD_INIT, /* m_base */
-  "_tf2_py",             /* m_name */
-  nullptr,                  /* m_doc */
-  -1,                    /* m_size - state size (but we're using globals) */
-  module_methods,        /* m_methods */
-  nullptr,                  /* m_slots */
-  nullptr,                  /* m_traverse */
-  nullptr,                  /* m_clear */
-  nullptr,                  /* m_free */
+static int moduleClear(PyObject * module)
+{
+  auto * state = static_cast<TfModuleState *>(PyModule_GetState(module));
+  if (state) {
+    for (const auto & spec : exceptions) {
+      Py_CLEAR(state->*(spec.member));
+    }
+  }
+  return 0;
+}
+
+static PyModuleDef_Slot tf_module_slots[] = {
+  {Py_mod_exec, reinterpret_cast<void *>(moduleExec)},
+#if PY_VERSION_HEX >= 0x030C0000
+  {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
+#ifdef Py_GIL_DISABLED
+  {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+#endif
+  {0, nullptr},
+};
+
+PyModuleDef tf_module = {
+  PyModuleDef_HEAD_INIT,
+  "_tf2_py",
+  nullptr,
+  sizeof(TfModuleState),
+  nullptr,
+  tf_module_slots,
+  moduleTraverse,
+  moduleClear,
+  nullptr,
 };
 
 PyMODINIT_FUNC PyInit__tf2_py()
 {
-  if (!staticInit()) {
-    return nullptr;
-  }
-  return moduleInit(PyModule_Create(&tf_module));
+  return PyModuleDef_Init(&tf_module);
 }

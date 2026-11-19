@@ -29,11 +29,16 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 from concurrent.futures import ThreadPoolExecutor
+import os
+import subprocess
+import sys
+import sysconfig
+import textwrap
 import unittest
 
 from geometry_msgs.msg import TransformStamped
-import rclpy
 from rclpy.duration import Duration
+import rclpy.time
 from rpyutils import add_dll_directories_from_env
 
 # Since Python 3.8, on Windows we should ensure DLL directories are explicitly added
@@ -78,6 +83,75 @@ class TestBufferClient(unittest.TestCase):
             buffer_core.clear()
         buffer_core.__init__()
         buffer_core.clear()
+
+    @unittest.skipUnless(sysconfig.get_config_var('Py_GIL_DISABLED'), 'needs free-threaded Python')
+    def test_native_buffer_keeps_gil_disabled(self):
+        script = textwrap.dedent('''
+            from concurrent.futures import ThreadPoolExecutor
+            import sys
+
+            from rpyutils import add_dll_directories_from_env
+
+            assert sys.flags.gil is None and not sys._is_gil_enabled()
+            with add_dll_directories_from_env('PATH'):
+                from test_tf2_py._tf2_py import BufferCore, LookupException
+
+            from builtin_interfaces.msg import Time
+            from geometry_msgs.msg import TransformStamped
+
+            class Buffer(BufferCore):
+                pass
+
+            buffer = Buffer()
+            stamp = Time(sec=1)
+
+            def insert(frame):
+                transform = TransformStamped(child_frame_id=frame)
+                transform.header.frame_id = 'root'
+                transform.header.stamp = stamp
+                transform.transform.rotation.w = 1.0
+                buffer.set_transform_static(transform, 'test')
+
+            insert('fixed')
+
+            class SingleReadTime:
+                def __init__(self):
+                    self.read_seconds = False
+
+                @property
+                def sec(self):
+                    assert not self.read_seconds
+                    self.read_seconds = True
+                    return 1
+
+                nanosec = 0
+
+            assert buffer.can_transform_core('root', 'fixed', SingleReadTime())[0]
+
+            def worker(index):
+                for number in range(100):
+                    if index % 2:
+                        insert(f'frame_{index}_{number}')
+                    else:
+                        result = buffer.lookup_transform_core('root', 'fixed', stamp)
+                        assert result.child_frame_id == 'fixed'
+                        assert result.transform.rotation.w == 1.0
+                try:
+                    buffer.lookup_transform_core('root', 'missing', stamp)
+                except LookupException:
+                    pass
+                else:
+                    raise AssertionError('missing frame was accepted')
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(worker, range(8)))
+
+            assert 'rclpy' not in sys.modules
+            assert not sys._is_gil_enabled()
+        ''')
+        env = os.environ.copy()
+        env.pop('PYTHON_GIL', None)
+        subprocess.run([sys.executable, '-c', script], env=env, check=True, timeout=90)
 
     def test_shared_buffer_can_be_reinitialized(self):
         class Buffer(BufferCore):
