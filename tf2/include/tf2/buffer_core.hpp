@@ -264,10 +264,18 @@ public:
   // Tell the buffer that there are multiple threads servicing it.
   // This is useful for derived classes to know if they can block or not.
   TF2_PUBLIC
-  void setUsingDedicatedThread(bool value) {using_dedicated_thread_ = value;}
+  void setUsingDedicatedThread(bool value)
+  {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    using_dedicated_thread_ = value;
+  }
   // Get the state of using_dedicated_thread_
   TF2_PUBLIC
-  bool isUsingDedicatedThread() const {return using_dedicated_thread_;}
+  bool isUsingDedicatedThread() const
+  {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    return using_dedicated_thread_;
+  }
 
 
   /* Backwards compatibility section for tf::Transformer you should not use these
@@ -294,11 +302,13 @@ public:
   TF2_PUBLIC
   CompactFrameID _lookupFrameNumber(const std::string & frameid_str) const
   {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
     return lookupFrameNumber(frameid_str);
   }
   TF2_PUBLIC
   CompactFrameID _lookupOrInsertFrameNumber(const std::string & frameid_str)
   {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
     return lookupOrInsertFrameNumber(frameid_str);
   }
 
@@ -316,6 +326,7 @@ public:
     const char * function_name_arg,
     const std::string & frame_id) const
   {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
     return validateFrameId(function_name_arg, frame_id);
   }
 

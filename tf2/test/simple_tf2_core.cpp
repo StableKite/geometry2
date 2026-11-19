@@ -31,8 +31,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <future>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "builtin_interfaces/msg/time.hpp"
@@ -63,6 +65,45 @@ TEST(tf2, setTransformValid)
   st.child_frame_id = "child";
   st.transform.rotation.w = 1;
   EXPECT_TRUE(tfc.setTransform(st, "authority1"));
+}
+
+TEST(tf2, ReadsEstablishedFramesDuringNewFrameInsertion)
+{
+  tf2::BufferCore buffer;
+  geometry_msgs::msg::TransformStamped transform;
+  transform.header.frame_id = "root";
+  transform.header.stamp.sec = 1;
+  transform.child_frame_id = "fixed";
+  transform.transform.rotation.w = 1;
+  ASSERT_TRUE(buffer.setTransform(transform, "test", true));
+  transform.header.frame_id = "fixed";
+  transform.child_frame_id = "leaf";
+  ASSERT_TRUE(buffer.setTransform(transform, "test", true));
+
+  std::promise<void> read_started;
+  auto start = read_started.get_future();
+  std::thread writer([&buffer, &start, transform]() mutable {
+      start.wait();
+      for (int i = 0; i < 2000; ++i) {
+        transform.child_frame_id = "new_" + std::to_string(i);
+        EXPECT_TRUE(buffer.setTransform(transform, "test", true));
+      }
+    });
+
+  read_started.set_value();
+  const auto time = tf2::timeFromSec(1.0);
+  for (int i = 0; i < 2000; ++i) {
+    EXPECT_TRUE(buffer.canTransform("root", "leaf", time));
+    EXPECT_TRUE(buffer.canTransform("root", time, "leaf", time, "fixed"));
+    EXPECT_NO_THROW(buffer.lookupTransform("root", time, "leaf", time, "fixed"));
+    EXPECT_NE(buffer._lookupFrameNumber("leaf"), 0u);
+    EXPECT_EQ(
+      buffer.addTransformableRequest(
+        [](auto, const auto &, const auto &, auto, auto) {},
+        "root", "leaf", time),
+      0u);
+  }
+  writer.join();
 }
 
 TEST(tf2, setTransformValidWithCallback)

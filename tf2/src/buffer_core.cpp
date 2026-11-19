@@ -616,13 +616,15 @@ geometry_msgs::msg::VelocityStamped BufferCore::lookupVelocity(
   const TimePoint & time, const tf2::Duration & averaging_interval) const
 {
   tf2::TimePoint latest_time;
-  // TODO(anyone): This is incorrect, but better than nothing.  Really we want the latest time for
-  // any of the frames
-  getLatestCommonTime(
-    lookupFrameNumber(observation_frame),
-    lookupFrameNumber(tracking_frame),
-    latest_time,
-    0);
+  {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    // TODO(anyone): We want the latest time for any of the frames.
+    getLatestCommonTime(
+      lookupFrameNumber(observation_frame),
+      lookupFrameNumber(tracking_frame),
+      latest_time,
+      nullptr);
+  }
 
   auto time_seconds = tf2::timeToSec(time);
   auto averaging_interval_seconds = std::chrono::duration<double>(averaging_interval).count();
@@ -885,9 +887,12 @@ void BufferCore::lookupTransformImpl(
   const std::string & fixed_frame, tf2::Transform & transform,
   TimePoint & time_out) const
 {
-  validateFrameId("lookupTransform argument target_frame", target_frame);
-  validateFrameId("lookupTransform argument source_frame", source_frame);
-  validateFrameId("lookupTransform argument fixed_frame", fixed_frame);
+  {
+    std::lock_guard<std::mutex> lock(frame_mutex_);
+    validateFrameId("lookupTransform argument target_frame", target_frame);
+    validateFrameId("lookupTransform argument source_frame", source_frame);
+    validateFrameId("lookupTransform argument fixed_frame", fixed_frame);
+  }
 
   tf2::Transform transform1, transform2;
 
@@ -920,11 +925,11 @@ struct CanTransformAccum
   TransformStorage st;
 };
 
+// The caller holds frame_mutex_ from frame lookup through traversal.
 bool BufferCore::canTransformInternal(
   CompactFrameID target_id, CompactFrameID source_id,
   const TimePoint & time, std::string * error_msg) const
 {
-  std::unique_lock<std::mutex> lock(frame_mutex_);
   if (target_id == 0 || source_id == 0) {
     if (error_msg) {
       *error_msg = "Source or target frame is not yet defined";
@@ -956,6 +961,7 @@ bool BufferCore::canTransform(
     return true;
   }
 
+  std::lock_guard<std::mutex> lock(frame_mutex_);
   CompactFrameID target_id = validateFrameId(
     "canTransform argument target_frame", target_frame, error_msg);
   if (target_id == 0) {
@@ -975,6 +981,7 @@ bool BufferCore::canTransform(
   const std::string & source_frame, const TimePoint & source_time,
   const std::string & fixed_frame, std::string * error_msg) const
 {
+  std::lock_guard<std::mutex> lock(frame_mutex_);
   CompactFrameID target_id = validateFrameId(
     "canTransform argument target_frame", target_frame, error_msg);
   if (target_id == 0) {
@@ -1362,22 +1369,24 @@ TransformableRequestHandle BufferCore::addTransformableRequest(
   std::unique_lock<std::mutex> lock(transformable_requests_mutex_);
 
   TransformableRequest req;
-  req.target_id = lookupFrameNumber(target_frame);
-  req.source_id = lookupFrameNumber(source_frame);
+  {
+    std::lock_guard<std::mutex> frame_lock(frame_mutex_);
+    req.target_id = lookupFrameNumber(target_frame);
+    req.source_id = lookupFrameNumber(source_frame);
 
-  // First check if the request is already transformable.  If it is, return immediately
-  if (canTransformInternal(req.target_id, req.source_id, time, 0)) {
-    return 0;
-  }
+    // First check whether the request is already transformable.
+    if (canTransformInternal(req.target_id, req.source_id, time, nullptr)) {
+      return 0;
+    }
 
-  // Might not be transformable at all, ever (if it's too far in the past)
-  if (req.target_id && req.source_id) {
-    TimePoint latest_time;
-    // TODO(anyone): This is incorrect, but better than nothing.  Really we want the latest time for
-    // any of the frames
-    getLatestCommonTime(req.target_id, req.source_id, latest_time, 0);
-    if ((latest_time != TimePointZero) && (time + cache_time_ < latest_time)) {
-      return 0xffffffffffffffffULL;
+    // The requested time might be outside the cache.
+    if (req.target_id && req.source_id) {
+      TimePoint latest_time;
+      // TODO(anyone): We want the latest time for any of the frames.
+      getLatestCommonTime(req.target_id, req.source_id, latest_time, nullptr);
+      if ((latest_time != TimePointZero) && (time + cache_time_ < latest_time)) {
+        return 0xffffffffffffffffULL;
+      }
     }
   }
 
@@ -1481,6 +1490,7 @@ void BufferCore::testTransformableRequests()
 
   {
     std::unique_lock<std::mutex> lock(transformable_requests_mutex_);
+    std::lock_guard<std::mutex> frame_lock(frame_mutex_);
     size_t i = 0;
     while (i < transformable_requests_.size()) {
       TransformableRequest & req = transformable_requests_[i];
