@@ -86,7 +86,7 @@ class TestBufferClient(unittest.TestCase):
 
     @unittest.skipUnless(sysconfig.get_config_var('Py_GIL_DISABLED'), 'needs free-threaded Python')
     def test_native_buffer_keeps_gil_disabled(self):
-        script = textwrap.dedent('''
+        script = textwrap.dedent("""
             from concurrent.futures import ThreadPoolExecutor
             import sys
 
@@ -148,7 +148,7 @@ class TestBufferClient(unittest.TestCase):
 
             assert 'rclpy' not in sys.modules
             assert not sys._is_gil_enabled()
-        ''')
+        """)
         env = os.environ.copy()
         env.pop('PYTHON_GIL', None)
         subprocess.run([sys.executable, '-c', script], env=env, check=True, timeout=90)
