@@ -89,12 +89,15 @@ class TestBufferClient(unittest.TestCase):
         script = textwrap.dedent("""
             from concurrent.futures import ThreadPoolExecutor
             import sys
+            from sysconfig import get_config_var
 
             from rpyutils import add_dll_directories_from_env
 
             assert sys.flags.gil is None and not sys._is_gil_enabled()
             with add_dll_directories_from_env('PATH'):
                 from test_tf2_py._tf2_py import BufferCore, LookupException
+                from test_tf2_py._tf2_py import __file__ as extension_file
+            assert extension_file.endswith(get_config_var('EXT_SUFFIX')), extension_file
 
             from builtin_interfaces.msg import Time
             from geometry_msgs.msg import TransformStamped

@@ -46,7 +46,7 @@ find_package(tf2 REQUIRED)
 
 ament_python_install_package(${PROJECT_NAME})
 
-python3_add_library(_tf2_py src/tf2_py.cpp)
+python3_add_library(_tf2_py MODULE WITH_SOABI src/tf2_py.cpp)
 
 if(WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
   # python3_add_library should really take care of this for us, but it doesn't
